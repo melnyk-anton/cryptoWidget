@@ -25,6 +25,7 @@ let smoothOffset = 0;
 
 function drawTextWithLetterSpacing(ctx, text, x, y, spacing) {
     let currentX = x;
+    let totalWidth = 0;
 
     for (let i = 0; i < text.length; i++) {
         const char = text[i];
@@ -38,24 +39,28 @@ function drawTextWithLetterSpacing(ctx, text, x, y, spacing) {
 
         let extraSpacing = spacing;
 
-        // Optional tweak: reduce space after narrow characters like '.'
         if (char === '.' || char === ',') {
-            extraSpacing *= 0.3; // or even 0
+            extraSpacing *= 0.3;
         }
 
-        // Don't apply spacing after the last character
+        const charWidth = metrics.width;
+
         if (i < text.length - 1) {
-            currentX += metrics.width + extraSpacing;
+            currentX += charWidth + extraSpacing;
+            totalWidth += charWidth + extraSpacing;
         } else {
-            currentX += metrics.width;
+            currentX += charWidth;
+            totalWidth += charWidth;
         }
     }
+
+    return totalWidth;
 }
 
 
 
 function drawGraph() {
-    if (priceHistory.length < 2) return;
+    if (priceHistory.length < 6) return;
 
     const graphHeight = 60;
     const graphWidth = canvas.width - 160;
@@ -129,11 +134,11 @@ function drawPrice(newValue) {
 
     let textX = canvas.width / 2 - 167;
     const textY = 172;
-    drawTextWithLetterSpacing(ctx, text, textX, textY, 2.2);
+    const textWidth = drawTextWithLetterSpacing(ctx, text, textX, textY, 2.2);
+    const arrowX = textX + textWidth + 34; // 20px padding after text
+
     //ctx.fillText(text, textX, textY);
 
-    const textWidth = ctx.measureText(text).width;
-    const arrowX = textX + textWidth / 2 + 182;
     const arrowY = textY - 5;
     const arrowColor = isUp ? "#59a262" : "#e74c3c";
     const arrowRotation = isUp ? Math.PI / 2 : -Math.PI / 2;
