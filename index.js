@@ -183,7 +183,7 @@ const logoSrc = canvas.dataset.logo;
 const pair = canvas.dataset.pair || "BTCUSDT";
 
 let priceHistory = [];
-const maxPoints = 30;
+const maxPoints = 450;
 let currentValue = 528.80;
 let displayedMin = null;
 let displayedMax = null;
@@ -352,7 +352,7 @@ function drawGraphLine() {
 
     const range = displayedMax - displayedMin + 2 || 1;
     const originalPoints = priceHistory.map((price, i) => {
-        const x = left + (i / (maxPoints - 1)) * graphWidth;
+        const x = left + (i / (maxPoints - 1)) * (graphWidth);
         const y = bottom - ((price - displayedMin) / range) * graphHeight;
         return [x, y];
     });
@@ -603,15 +603,40 @@ function drawAll(newValue) {
 
     gl.disable(gl.BLEND);
 
-    currentValue = newValue;
+    //currentValue = newValue;
+}
+let iters = 0;
+function animationSimulation(change, newvalue) {
+    return new Promise((resolve) => {
+        let curVal = currentValue;
+        let steps = 25;
+        let i = 0;
+        let stepChange = change / steps;
+
+        function anim() {
+            if (i >= steps) {
+                curVal = newvalue;
+                drawAll(curVal);
+                resolve(curVal);  // ✅ Waits until animation is done
+                return;
+            }
+
+            curVal += stepChange;
+            drawAll(curVal);
+            i++;
+            setTimeout(anim, 10);
+        }
+
+        anim();
+    });
 }
 
-function startSimulation() {
-    function update() {
+async function startSimulation() {
+    while (true) {
         const change = (Math.random() - 0.5) * 2;
         const newValue = currentValue + change;
-        drawAll(newValue);
-        setTimeout(update, 250);
+        currentValue = await animationSimulation(change, newValue);
+        //console.log("Done:", currentValue);
+        await new Promise(r => setTimeout(r, 250));
     }
-    update();
 }
