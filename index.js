@@ -1,642 +1,649 @@
 const canvas = document.getElementById("cryptoGraphWidget");
-const gl = canvas.getContext("webgl");
+const gl = canvas.getContext("webgl2");
+gl.viewport(0, 0, canvas.width, canvas.height);
 
-gl.clearColor(0.06, 0.07, 0.09, 1);
 
-const vertexShaderSource = `
-    attribute vec2 a_position;
-    uniform vec2 u_resolution;
-    void main() {
-        vec2 zeroToOne = a_position / u_resolution;
-        vec2 zeroToTwo = zeroToOne * 2.0;
-        vec2 clipSpace = zeroToTwo - 1.0;
-        gl_Position = vec4(clipSpace * vec2(1, -1), 0, 1);
-    }
-`;
-const fragmentShaderSource = `
-    precision mediump float;
-    uniform vec4 u_color;
-    void main() {
-        gl_FragColor = u_color;
-    }
-`;
+// ======================= SHADERS =========================
+const vertShaderCode = `#version 300 es
+precision mediump float;
 
-// New gradient fragment shader
-const gradientFragmentSource = `
-    precision mediump float;
-    uniform vec2 u_resolution;
-    uniform float u_topY;
-    uniform float u_bottomY;
-    uniform vec4 u_topColor;
-    uniform vec4 u_bottomColor;
-    
-    void main() {
-        float normalizedY = (gl_FragCoord.y - u_bottomY) / (u_topY - u_bottomY);
-        normalizedY = clamp(normalizedY, 0.0, 1.0);
-        gl_FragColor = mix(u_bottomColor, u_topColor, normalizedY);
-    }
+in vec2 a_position;
+in vec2 a_uv;
+
+uniform mat3 u_matrix;  // Add this
+out vec2 v_texcoord;
+
+void main() {
+    // Apply matrix transform
+    vec3 pos = u_matrix * vec3(a_position, 1.0);
+
+    gl_Position = vec4(pos.xy, 0, 1);
+    v_texcoord = a_uv;
+}
+
 `;
 
-const texturedVertexSrc = `
-    attribute vec2 a_position;
-    attribute vec2 a_texCoord;
-    uniform vec2 u_resolution;
-    uniform vec2 u_translation;
-    uniform vec2 u_size;
-    uniform float u_rotation;
-    varying vec2 v_texCoord;
+const fragShaderCode = `#version 300 es
+precision mediump float;
 
-    void main() {
-        vec2 pos = a_position * u_size - u_size * 0.5;
-        float cosR = cos(u_rotation);
-        float sinR = sin(u_rotation);
-        vec2 rotatedPos = vec2(
-            pos.x * cosR - pos.y * sinR,
-            pos.x * sinR + pos.y * cosR
-        );
-        vec2 finalPos = rotatedPos + u_translation + u_size * 0.5;
-        vec2 zeroToOne = finalPos / u_resolution;
-        vec2 zeroToTwo = zeroToOne * 2.0;
-        vec2 clipSpace = zeroToTwo - 1.0;
-        gl_Position = vec4(clipSpace * vec2(1, -1), 0, 1);
-        v_texCoord = a_texCoord;
-    }
-`;
-const texturedFragmentSrc = `
-    precision mediump float;
-    varying vec2 v_texCoord;
-    uniform sampler2D u_texture;
-    uniform vec4 u_tintColor;
-    uniform bool u_useTint;
+uniform sampler2D u_msdf_font;
+uniform float u_in_bias;
+uniform float u_out_bias;
+in vec2 v_texcoord;
+out vec4 FragColor;
+uniform vec4 bgColor;
+uniform vec4 fgColor;
+uniform float pxRange;
 
-    void main() {
-        vec4 texColor = texture2D(u_texture, v_texCoord);
-        // Only render pixels that have alpha, ignore transparent borders
-        if (texColor.a < 0.1) {
-            discard;
-        }
-        
-        if (u_useTint) {
-            // For arrow - apply tint color but keep original alpha
-            gl_FragColor = vec4(u_tintColor.rgb, texColor.a);
-        } else {
-            // For text - use original color
-            gl_FragColor = texColor;
-        }
-    }
+float screenPxRange() {
+    vec2 unitRange = vec2(pxRange) / vec2(textureSize(u_msdf_font, 0));
+    vec2 screenTexSize = vec2(1.0)/fwidth(v_texcoord);
+    return max(0.5*dot(unitRange, screenTexSize), 1.0);
+}
+
+float median(float r, float g, float b) {
+    return max(min(r, g), min(max(r, g), b));
+}
+
+void main() {
+    vec3 sampl = texture(u_msdf_font, v_texcoord).rgb;
+    float sigDist = median(sampl.r, sampl.g, sampl.b);
+    float screenPxDistance = screenPxRange()*(sigDist - 0.5);
+    float opacity = clamp(screenPxDistance + 0.5, 0.0, 1.0);
+    FragColor = mix(bgColor, fgColor, opacity);
+}
 `;
 
-function createShader(gl, type, source) {
+const vertShaderCodeImg = `#version 300 es
+precision mediump float;
+
+in vec2 a_position;
+in vec2 a_texcoord;
+
+uniform float u_angle;
+uniform vec2 u_center; // image center in clip space
+
+out vec2 v_texcoord;
+
+void main() {
+    // Translate to origin
+    vec2 pos = a_position - u_center;
+
+    // Rotate
+    float cosA = cos(u_angle);
+    float sinA = sin(u_angle);
+    vec2 rotated = vec2(
+        pos.x * cosA - pos.y * sinA,
+        pos.x * sinA + pos.y * cosA
+    );
+
+    // Translate back
+    rotated += u_center;
+
+    gl_Position = vec4(rotated, 0.0, 1.0);
+    v_texcoord = a_texcoord;
+}`;
+
+const fragShaderCodeImg = `#version 300 es
+precision mediump float;
+in vec2 v_texcoord;
+out vec4 outColor;
+
+uniform sampler2D u_texture;
+uniform vec4 u_tint; // RGBA color
+
+void main() {
+    vec4 texColor = texture(u_texture, v_texcoord);
+    outColor = texColor * u_tint;
+}
+
+`;
+
+// =================== SHADER SETUP ========================
+function compileShader(type, source) {
     const shader = gl.createShader(type);
     gl.shaderSource(shader, source);
     gl.compileShader(shader);
     if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        console.error("Shader compile failed:", gl.getShaderInfoLog(shader));
-        gl.deleteShader(shader);
-        return null;
+        console.error(gl.getShaderInfoLog(shader));
     }
     return shader;
 }
-
-function createProgram(gl, vertexShader, fragmentShader) {
+function processProgram(vertexShader, fragmentShader){
     const program = gl.createProgram();
     gl.attachShader(program, vertexShader);
     gl.attachShader(program, fragmentShader);
-    gl.linkProgram(program);
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        console.error("Program linking failed:", gl.getProgramInfoLog(program));
-        gl.deleteProgram(program);
-        return null;
-    }
     return program;
 }
+let viewProjectionMat;
+const vertexShader = compileShader(gl.VERTEX_SHADER, vertShaderCode);
+const fragmentShader = compileShader(gl.FRAGMENT_SHADER, fragShaderCode);
+const vertexShaderImg = compileShader(gl.VERTEX_SHADER, vertShaderCodeImg);
+const fragmentShaderImg = compileShader(gl.FRAGMENT_SHADER, fragShaderCodeImg);
 
-const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
-const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
-const colorProgram = createProgram(gl, vertexShader, fragmentShader);
+const program = processProgram(vertexShader, fragmentShader);
+const program2 = processProgram(vertexShaderImg, fragmentShaderImg);
 
-// Create gradient program
-const gradientFragmentShader = createShader(gl, gl.FRAGMENT_SHADER, gradientFragmentSource);
-const gradientProgram = createProgram(gl, vertexShader, gradientFragmentShader);
 
-const texturedVertexShader = createShader(gl, gl.VERTEX_SHADER, texturedVertexSrc);
-const texturedFragmentShader = createShader(gl, gl.FRAGMENT_SHADER, texturedFragmentSrc);
-const texturedProgram = createProgram(gl, texturedVertexShader, texturedFragmentShader);
 
-const positionAttribLoc = gl.getAttribLocation(colorProgram, "a_position");
-const resolutionUniformLoc = gl.getUniformLocation(colorProgram, "u_resolution");
-const colorUniformLoc = gl.getUniformLocation(colorProgram, "u_color");
+gl.linkProgram(program);
 
-// Gradient program uniforms
-const gradientPositionLoc = gl.getAttribLocation(gradientProgram, "a_position");
-const gradientResolutionLoc = gl.getUniformLocation(gradientProgram, "u_resolution");
-const gradientTopYLoc = gl.getUniformLocation(gradientProgram, "u_topY");
-const gradientBottomYLoc = gl.getUniformLocation(gradientProgram, "u_bottomY");
-const gradientTopColorLoc = gl.getUniformLocation(gradientProgram, "u_topColor");
-const gradientBottomColorLoc = gl.getUniformLocation(gradientProgram, "u_bottomColor");
+gl.linkProgram(program2);
 
-const texPositionLoc = gl.getAttribLocation(texturedProgram, "a_position");
-const texTexCoordLoc = gl.getAttribLocation(texturedProgram, "a_texCoord");
-const texResolutionLoc = gl.getUniformLocation(texturedProgram, "u_resolution");
-const texTranslationLoc = gl.getUniformLocation(texturedProgram, "u_translation");
-const texSizeLoc = gl.getUniformLocation(texturedProgram, "u_size");
-const texRotationLoc = gl.getUniformLocation(texturedProgram, "u_rotation");
-const texTintColorLoc = gl.getUniformLocation(texturedProgram, "u_tintColor");
-const texUseTintLoc = gl.getUniformLocation(texturedProgram, "u_useTint");
-const texSamplerLoc = gl.getUniformLocation(texturedProgram, "u_texture");
+gl.useProgram(program);
 
+let camera = {
+  x: 0,
+  y: 0,
+  rotation: 0,
+  zoom: 1,
+};
+
+
+
+// Attribute and Uniform Locations
+const a_position = gl.getAttribLocation(program, "a_position");
+const a_uv = gl.getAttribLocation(program, "a_uv");
+const u_resolution = gl.getUniformLocation(program, "u_resolution");
+const u_msdf_font = gl.getUniformLocation(program, "u_msdf_font");
+const u_in_bias = gl.getUniformLocation(program, "u_in_bias");
+const u_out_bias = gl.getUniformLocation(program, "u_out_bias");
+const bgColor = gl.getUniformLocation(program, "bgColor");
+const fgColor = gl.getUniformLocation(program, "fgColor");
+const pxRange = gl.getUniformLocation(program, "pxRange");
+const u_matrix = gl.getUniformLocation(program, "u_matrix");
+let MatType = Float32Array;
+
+
+// Initial uniforms
+gl.uniform2f(u_resolution, canvas.width, canvas.height);
+gl.uniform1f(u_in_bias, 0.0);
+gl.uniform1f(u_out_bias, 0.0);
+gl.uniform1i(u_msdf_font, 0);
+gl.uniform4f(bgColor, 0.0, 0.0, 0.0, 0.0);
+gl.uniform4f(fgColor, 1.0, 1.0, 1.0, 1.0);
+gl.uniform1f(pxRange, 6.0);
+updateViewProjection();
+gl.uniformMatrix3fv(u_matrix, false, multiply(viewProjectionMat, makeCameraMatrix()));
+
+// Buffers
 const positionBuffer = gl.createBuffer();
-const gradientBuffer = gl.createBuffer();
+const uvBuffer = gl.createBuffer();
+gl.enableVertexAttribArray(a_position);
+gl.enableVertexAttribArray(a_uv);
 
-const texPositionBuffer = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, texPositionBuffer);
-const quadPositions = [
-    0, 0,
-    1, 0,
-    0, 1,
-    1, 1,
-];
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(quadPositions), gl.STATIC_DRAW);
+// Enable blending for MSDF
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
-const texCoordBuffer = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
-const quadTexCoords = [
-    0, 0,
-    1, 0,
-    0, 1,
-    1, 1,
-];
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(quadTexCoords), gl.STATIC_DRAW);
-
-const textCanvas = document.createElement("canvas");
-const textCtx = textCanvas.getContext("2d");
-const textTexture = gl.createTexture();
-gl.bindTexture(gl.TEXTURE_2D, textTexture);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-
-// Extract static info from HTML data attributes
-const platform = canvas.dataset.platform || "Platform";
-const logoSrc = canvas.dataset.logo;
-const pair = canvas.dataset.pair || "BTCUSDT";
-
-let priceHistory = [];
-const maxPoints = 450;
-let currentValue = 528.80;
-let displayedMin = null;
-let displayedMax = null;
-const scaleLerpFactor = 0.15;
-
-let arrowTexture = null;
-let arrowLoaded = false;
-let logoTexture = null;
-let logoLoaded = false;
-
-// Create additional canvas and texture for platform/pair text
-const platformTextCanvas = document.createElement("canvas");
-const platformTextCtx = platformTextCanvas.getContext("2d");
-const platformTextTexture = gl.createTexture();
-gl.bindTexture(gl.TEXTURE_2D, platformTextTexture);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-
-const imgArrow = new Image();
-imgArrow.src = "/src/up_arrow.png";
-imgArrow.onload = () => {
-    arrowTexture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, arrowTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imgArrow);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    arrowLoaded = true;
-    checkAllLoaded();
-};
-
-const imgLogo = new Image();
-imgLogo.src = logoSrc;
-imgLogo.onload = () => {
-    logoTexture = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, logoTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, imgLogo);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    logoLoaded = true;
-    checkAllLoaded();
-};
-
-function checkAllLoaded() {
-    if (arrowLoaded && logoLoaded) {
-        updatePlatformTextTexture();
-        startSimulation();
-    }
+// =================== LOAD FONT & IMAGE ====================
+async function loadJSON(url) {
+    const res = await fetch(url);
+    return await res.json();
 }
 
-// Catmull-Rom spline interpolation for smooth curves
-function catmullRomSpline(p0, p1, p2, p3, t) {
-    const t2 = t * t;
-    const t3 = t2 * t;
-    
-    const x = 0.5 * ((2 * p1[0]) +
-        (-p0[0] + p2[0]) * t +
-        (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
-        (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3);
-    
-    const y = 0.5 * ((2 * p1[1]) +
-        (-p0[1] + p2[1]) * t +
-        (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
-        (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3);
-    
-    return [x, y];
-}
-
-// Generate smooth curve points
-function generateSmoothCurve(points) {
-    if (points.length < 4) return points;
-    
-    const smoothPoints = [];
-    const segments = 8; // Number of interpolated points between each pair
-    
-    for (let i = 0; i < points.length - 1; i++) {
-        const p0 = i === 0 ? points[0] : points[i - 1];
-        const p1 = points[i];
-        const p2 = points[i + 1];
-        const p3 = i === points.length - 2 ? points[points.length - 1] : points[i + 2];
-        
-        for (let j = 0; j < segments; j++) {
-            const t = j / segments;
-            const smoothPoint = catmullRomSpline(p0, p1, p2, p3, t);
-            smoothPoints.push(smoothPoint);
-        }
-    }
-    
-    // Add the last point
-    smoothPoints.push(points[points.length - 1]);
-    return smoothPoints;
-}
-
-// Create thick line using triangle strip
-function createThickLineVertices(points, thickness) {
-    const vertices = [];
-    const halfThickness = thickness / 2;
-    
-    for (let i = 0; i < points.length; i++) {
-        let normal;
-        
-        if (i === 0) {
-            // First point - use direction to next point
-            const dx = points[i + 1][0] - points[i][0];
-            const dy = points[i + 1][1] - points[i][1];
-            const length = Math.sqrt(dx * dx + dy * dy);
-            normal = [-dy / length, dx / length];
-        } else if (i === points.length - 1) {
-            // Last point - use direction from previous point
-            const dx = points[i][0] - points[i - 1][0];
-            const dy = points[i][1] - points[i - 1][1];
-            const length = Math.sqrt(dx * dx + dy * dy);
-            normal = [-dy / length, dx / length];
-        } else {
-            // Middle points - average of adjacent directions
-            const dx1 = points[i][0] - points[i - 1][0];
-            const dy1 = points[i][1] - points[i - 1][1];
-            const length1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
-            
-            const dx2 = points[i + 1][0] - points[i][0];
-            const dy2 = points[i + 1][1] - points[i][1];
-            const length2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
-            
-            const n1 = [-dy1 / length1, dx1 / length1];
-            const n2 = [-dy2 / length2, dx2 / length2];
-            
-            const nx = (n1[0] + n2[0]) / 2;
-            const ny = (n1[1] + n2[1]) / 2;
-            const length = Math.sqrt(nx * nx + ny * ny);
-            normal = [nx / length, ny / length];
-        }
-        
-        // Add two vertices for each point (top and bottom of thick line)
-        vertices.push(
-            points[i][0] + normal[0] * halfThickness,
-            points[i][1] + normal[1] * halfThickness,
-            points[i][0] - normal[0] * halfThickness,
-            points[i][1] - normal[1] * halfThickness
-        );
-    }
-    
-    return vertices;
-}
-
-function drawGraphLine() {
-    if (priceHistory.length < 6) return;
-
-    const graphHeight = 60;
-    const graphWidth = canvas.width - 160;
-    const bottom = canvas.height - 117;
-    const left = 80;
-
-    const trueMin = Math.min(...priceHistory) - 3;
-    const trueMax = Math.max(...priceHistory) - 3;
-
-    if (displayedMin === null) displayedMin = trueMin;
-    if (displayedMax === null) displayedMax = trueMax;
-
-    displayedMin += (trueMin - displayedMin) * scaleLerpFactor;
-    displayedMax += (trueMax - displayedMax) * scaleLerpFactor;
-
-    const range = displayedMax - displayedMin + 2 || 1;
-    const originalPoints = priceHistory.map((price, i) => {
-        const x = left + (i / (maxPoints - 1)) * (graphWidth);
-        const y = bottom - ((price - displayedMin) / range) * graphHeight;
-        return [x, y];
+function loadImage(url) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = url;
     });
+}
+async function loadFontAndImage(jsonPath, imgPath) {
+    const font = await loadJSON(jsonPath);
+    const image = await loadImage(imgPath);
 
-    // Generate smooth curve points
-    const smoothPoints = generateSmoothCurve(originalPoints);
-
-    // Create gradient fill using triangle strip with smooth points
-    const gradientVertices = [];
+    return { font, image };
+}
+async function init() {
     
-    // Create pairs of vertices: one at the line point, one at the bottom
-    for (let i = 0; i < smoothPoints.length; i++) {
-        // Top vertex (line point)
-        gradientVertices.push(smoothPoints[i][0], smoothPoints[i][1]);
-        // Bottom vertex (at baseline)
-        gradientVertices.push(smoothPoints[i][0], bottom);
-    }
-
-    // Draw gradient fill
-    gl.useProgram(gradientProgram);
+    const resources = await Promise.all([
+        //loadFontAndImage("./fonts/ida-light-msdf/ida-light-msdf.json", "/fonts/ida-light-msdf/ida-light.png"),
+        //loadFontAndImage("./fonts/arial-msdf/arial-msdf.json", "/fonts/arial-msdf/arial.png"),
+        loadFontAndImage("./fonts/atlas-128-6/atlas-128-6.json", "./fonts/atlas-128-6/atlas-128-6.png"),
+        loadImage('/src/up_arrow.png'),
+        loadImage('/src/binance_logo.png')
+    ]);
+    const texture = gl.createTexture();
     
-    gl.bindBuffer(gl.ARRAY_BUFFER, gradientBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(gradientVertices), gl.STATIC_DRAW);
     
-    gl.enableVertexAttribArray(gradientPositionLoc);
-    gl.vertexAttribPointer(gradientPositionLoc, 2, gl.FLOAT, false, 0, 0);
+        
+    render(resources, texture);
     
-    gl.uniform2f(gradientResolutionLoc, canvas.width, canvas.height);
-    gl.uniform1f(gradientTopYLoc, canvas.height - Math.min(...smoothPoints.map(p => p[1])));
-    gl.uniform1f(gradientBottomYLoc, canvas.height - bottom);
-    
-    // Convert #cf1d45 to rgba with alpha for gradient
-    gl.uniform4f(gradientTopColorLoc, 207/255, 29/255, 69/255, 0.4); // Top color with some transparency
-    gl.uniform4f(gradientBottomColorLoc, 207/255, 29/255, 69/255, 0.0); // Bottom color fully transparent
-    
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, gradientVertices.length / 2);
-
-    // Draw thick smooth line
-    const lineThickness = 3.0; // Adjust thickness here
-    const thickLineVertices = createThickLineVertices(smoothPoints, lineThickness);
-
-    gl.useProgram(colorProgram);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(thickLineVertices), gl.STATIC_DRAW);
-
-    gl.enableVertexAttribArray(positionAttribLoc);
-    gl.vertexAttribPointer(positionAttribLoc, 2, gl.FLOAT, false, 0, 0);
-
-    gl.uniform2f(resolutionUniformLoc, canvas.width, canvas.height);
-    // Changed color to #cf1d45
-    gl.uniform4f(colorUniformLoc, 207/255, 29/255, 69/255, 1);
-
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, thickLineVertices.length / 2);
 }
 
-function drawTexturedQuad(texture, x, y, width, height, rotation = 0, tintColor = [1, 1, 1, 1], useTint = false) {
-    gl.useProgram(texturedProgram);
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, texPositionBuffer);
-    gl.enableVertexAttribArray(texPositionLoc);
-    gl.vertexAttribPointer(texPositionLoc, 2, gl.FLOAT, false, 0, 0);
+  function identity(dst) {
+    dst = dst || new MatType(9);
+    dst[0] = 1;
+    dst[1] = 0;
+    dst[2] = 0;
+    dst[3] = 0;
+    dst[4] = 1;
+    dst[5] = 0;
+    dst[6] = 0;
+    dst[7] = 0;
+    dst[8] = 1;
 
-    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
-    gl.enableVertexAttribArray(texTexCoordLoc);
-    gl.vertexAttribPointer(texTexCoordLoc, 2, gl.FLOAT, false, 0, 0);
+    return dst;
+  }
 
-    gl.uniform2f(texResolutionLoc, canvas.width, canvas.height);
-    gl.uniform2f(texTranslationLoc, x, y);
-    gl.uniform2f(texSizeLoc, width, height);
-    gl.uniform1f(texRotationLoc, rotation);
-    gl.uniform4fv(texTintColorLoc, tintColor);
-    gl.uniform1i(texUseTintLoc, useTint ? 1 : 0);
+  function translation(tx, ty, dst) {
+    dst = dst || new MatType(9);
+
+    dst[0] = 1;
+    dst[1] = 0;
+    dst[2] = 0;
+    dst[3] = 0;
+    dst[4] = 1;
+    dst[5] = 0;
+    dst[6] = tx;
+    dst[7] = ty;
+    dst[8] = 1;
+
+    return dst;
+  }
+
+
+  function translate(m, tx, ty, dst) {    
+    return multiply(m, translation(tx, ty), dst);
+  }
+
+  function rotation(angleInRadians, dst) {
+    var c = Math.cos(angleInRadians);
+    var s = Math.sin(angleInRadians);
+
+    dst = dst || new MatType(9);
+
+    dst[0] = c;
+    dst[1] = -s;
+    dst[2] = 0;
+    dst[3] = s;
+    dst[4] = c;
+    dst[5] = 0;
+    dst[6] = 0;
+    dst[7] = 0;
+    dst[8] = 1;
+
+    return dst;
+  }
+
+  function rotate(m, angleInRadians, dst) {
+    return multiply(m, rotation(angleInRadians), dst);
+  }
+
+  function scaling(sx, sy, dst) {
+    dst = dst || new MatType(9);
+
+    dst[0] = sx;
+    dst[1] = 0;
+    dst[2] = 0;
+    dst[3] = 0;
+    dst[4] = sy;
+    dst[5] = 0;
+    dst[6] = 0;
+    dst[7] = 0;
+    dst[8] = 1;
+
+    return dst;
+  }
+
+
+  function scale(m, sx, sy, dst) {
+    return multiply(m, scaling(sx, sy), dst);
+  }
+
+function inverse(m, dst) {
+    dst = dst || new MatType(9);
+
+    const m00 = m[0 * 3 + 0];
+    const m01 = m[0 * 3 + 1];
+    const m02 = m[0 * 3 + 2];
+    const m10 = m[1 * 3 + 0];
+    const m11 = m[1 * 3 + 1];
+    const m12 = m[1 * 3 + 2];
+    const m20 = m[2 * 3 + 0];
+    const m21 = m[2 * 3 + 1];
+    const m22 = m[2 * 3 + 2];
+
+    const b01 =  m22 * m11 - m12 * m21;
+    const b11 = -m22 * m10 + m12 * m20;
+    const b21 =  m21 * m10 - m11 * m20;
+
+    const det = m00 * b01 + m01 * b11 + m02 * b21;
+    const invDet = 1.0 / det;
+
+    dst[0] = b01 * invDet;
+    dst[1] = (-m22 * m01 + m02 * m21) * invDet;
+    dst[2] = ( m12 * m01 - m02 * m11) * invDet;
+    dst[3] = b11 * invDet;
+    dst[4] = ( m22 * m00 - m02 * m20) * invDet;
+    dst[5] = (-m12 * m00 + m02 * m10) * invDet;
+    dst[6] = b21 * invDet;
+    dst[7] = (-m21 * m00 + m01 * m20) * invDet;
+    dst[8] = ( m11 * m00 - m01 * m10) * invDet;
+
+    return dst;
+  }
+
+  
+// Transform a point [x, y] using matrix m
+ function transformPoint(m, v) {
+    var v0 = v[0];
+    var v1 = v[1];
+    var d = v0 * m[0 * 3 + 2] + v1 * m[1 * 3 + 2] + m[2 * 3 + 2];
+    return [
+      (v0 * m[0 * 3 + 0] + v1 * m[1 * 3 + 0] + m[2 * 3 + 0]) / d,
+      (v0 * m[0 * 3 + 1] + v1 * m[1 * 3 + 1] + m[2 * 3 + 1]) / d,
+    ];
+  }
+
+function projection(width, height, dst) {
+    dst = dst || new MatType(9);
+    // Note: This matrix flips the Y axis so 0 is at the top.
+    
+    dst[0] = 2 / width;
+    dst[1] = 0;
+    dst[2] = 0;
+    dst[3] = 0;
+    dst[4] = -2 / height;
+    dst[5] = 0;
+    dst[6] = -1;
+    dst[7] = 1;
+    dst[8] = 1;
+
+    return dst;
+  }
+function multiply(a, b, dst) {
+    dst = dst || new MatType(9);
+    var a00 = a[0 * 3 + 0];
+    var a01 = a[0 * 3 + 1];
+    var a02 = a[0 * 3 + 2];
+    var a10 = a[1 * 3 + 0];
+    var a11 = a[1 * 3 + 1];
+    var a12 = a[1 * 3 + 2];
+    var a20 = a[2 * 3 + 0];
+    var a21 = a[2 * 3 + 1];
+    var a22 = a[2 * 3 + 2];
+    var b00 = b[0 * 3 + 0];
+    var b01 = b[0 * 3 + 1];
+    var b02 = b[0 * 3 + 2];
+    var b10 = b[1 * 3 + 0];
+    var b11 = b[1 * 3 + 1];
+    var b12 = b[1 * 3 + 2];
+    var b20 = b[2 * 3 + 0];
+    var b21 = b[2 * 3 + 1];
+    var b22 = b[2 * 3 + 2];
+
+    dst[0] = b00 * a00 + b01 * a10 + b02 * a20;
+    dst[1] = b00 * a01 + b01 * a11 + b02 * a21;
+    dst[2] = b00 * a02 + b01 * a12 + b02 * a22;
+    dst[3] = b10 * a00 + b11 * a10 + b12 * a20;
+    dst[4] = b10 * a01 + b11 * a11 + b12 * a21;
+    dst[5] = b10 * a02 + b11 * a12 + b12 * a22;
+    dst[6] = b20 * a00 + b21 * a10 + b22 * a20;
+    dst[7] = b20 * a01 + b21 * a11 + b22 * a21;
+    dst[8] = b20 * a02 + b21 * a12 + b22 * a22;
+
+    return dst;
+  }
+
+
+function makeCameraMatrix() {
+    const zoomScale = 1 / camera.zoom;
+  let cameraMat =identity();
+  cameraMat = translate(cameraMat, camera.x, camera.y);
+    cameraMat = rotate(cameraMat, camera.rotation);
+    cameraMat = scale(cameraMat, zoomScale, zoomScale);
+
+  //console.log(camera.x, camera.y);
+  
+  return cameraMat;
+}
+
+
+
+
+function updateViewProjection() {
+  const projectionMat = projection(gl.canvas.width, gl.canvas.height);
+  const cameraMat = makeCameraMatrix();
+    const viewMat = inverse(cameraMat);
+    viewProjectionMat = multiply(projectionMat, viewMat); // viewMat = inverse(cameraMat)
+
+}
+
+function render(resources, texture){
+     gl.clearColor(0.06, 0.07, 0.09, 1); // dark background
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    updateViewProjection();
+
+    gl.useProgram(program);
+    gl.uniformMatrix3fv(u_matrix, false, viewProjectionMat);
+    drawTextWithFont(resources[0].font, resources[0].image, "$ 528.80", 100, 100, 100, texture);
+    drawTextWithFont(resources[0].font, resources[0].image, "binance / BNBUSDC", 45, 150, 253, texture);
+
+    //gl.useProgram(program2);
+    //drawImage(resources[2], 475, 150, 52, 32);
+    //drawImage(resources[3], 150, 220, 52, 32);
+    
+
+   
+
+   //requestAnimationFrame(() => render(resources, texture));
+   //render(resources, texture);
+
+}
+
+function getClipSpaceMousePosition(e) {
+  const rect = canvas.getBoundingClientRect();
+  const cssX = e.clientX - rect.left;
+  const cssY = e.clientY - rect.top;
+  
+  const normalizedX = cssX / canvas.clientWidth;
+  const normalizedY = cssY / canvas.clientHeight;
+
+  const clipX = normalizedX *  2 - 1;
+  const clipY = normalizedY * -2 + 1;
+  
+  return [clipX, clipY];
+}
+
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+
+  const [clipX, clipY] = getClipSpaceMousePosition(e);
+  //console.log(clipX, clipY);
+
+  // World position before zoom
+  const worldBefore = transformPoint(inverse(viewProjectionMat), [clipX, clipY]);
+  
+
+  // Change zoom
+  const newZoom = camera.zoom * Math.pow(2, e.deltaY * -0.01);
+  camera.zoom = Math.max(0.02, Math.min(100, newZoom));
+
+  updateViewProjection();
+
+  // World position after zoom
+  const worldAfter = transformPoint(inverse(viewProjectionMat), [clipX, clipY]);
+
+    console.log(worldBefore[0], worldAfter[0]);
+    camera.x += (worldBefore[0]-worldAfter[0]);
+  camera.y += (worldBefore[1]-worldAfter[1]);
+
+    //console.log(worldAfter);
+  
+
+  updateViewProjection();
+
+  init();
+});
+
+
+async function drawTextWithFont(font, image, text, scale, x, y, texture) {
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.uniform1i(texSamplerLoc, 0);
-
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-}
-
-function updatePlatformTextTexture() {
-    const platformText = `${platform} / ${pair}`;
-    
-    // Use high DPI scaling for crisp text
-    const dpr = window.devicePixelRatio || 1;
-    const fontSize = 36;
-    const scaledFontSize = fontSize * dpr;
-    
-    // Set up high-resolution context
-    platformTextCtx.font = `${scaledFontSize}px 'Ida Light', Arial, sans-serif`;
-    const textMetrics = platformTextCtx.measureText(platformText);
-    
-    // Calculate dimensions including logo space
-    const logoSize = 28 * dpr;
-    const spacing = 10 * dpr;
-    const textWidth = Math.ceil(textMetrics.width);
-    const totalWidth = logoSize + spacing + textWidth;
-    const totalHeight = Math.max(logoSize, scaledFontSize * 1.2);
-    
-    platformTextCanvas.width = totalWidth;
-    platformTextCanvas.height = totalHeight;
-    
-    // Enable high-quality text rendering
-    platformTextCtx.imageSmoothingEnabled = true;
-    platformTextCtx.imageSmoothingQuality = 'high';
-    platformTextCtx.textRenderingOptimization = 'optimizeQuality';
-    
-    // Clear with transparent background
-    platformTextCtx.clearRect(0, 0, totalWidth, totalHeight);
-    
-    // Draw logo first with high quality
-    if (logoLoaded) {
-        const logoY = (totalHeight - logoSize) / 2;
-        platformTextCtx.drawImage(imgLogo, 0, logoY, logoSize, logoSize);
-        
-        // Apply white tint to logo (convert to white while preserving alpha)
-        const imageData = platformTextCtx.getImageData(0, logoY, logoSize, logoSize);
-        const data = imageData.data;
-        for (let i = 0; i < data.length; i += 4) {
-            if (data[i + 3] > 0) { // If pixel has alpha
-                data[i] = 255;     // Red = 255
-                data[i + 1] = 255; // Green = 255
-                data[i + 2] = 255; // Blue = 255
-                // Keep original alpha (data[i + 3])
-            }
-        }
-        platformTextCtx.putImageData(imageData, 0, logoY);
-    }
-    
-    // Draw high-quality text
-    platformTextCtx.font = `${scaledFontSize}px 'Ida Light', Arial, sans-serif`;
-    platformTextCtx.textAlign = 'left';
-    platformTextCtx.textBaseline = 'middle';
-    platformTextCtx.fillStyle = 'white';
-    
-    // Enable sub-pixel text rendering
-    platformTextCtx.textRenderingOptimization = 'optimizeQuality';
-    
-    const textX = logoSize + spacing;
-    const textY = totalHeight / 2 ;
-    platformTextCtx.fillText(platformText, textX, textY);
-    
-    // Update texture with linear filtering for smooth scaling
-    gl.bindTexture(gl.TEXTURE_2D, platformTextTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, platformTextCanvas);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    renderText(text, font, scale, x, y);
+
+    return 0;
 }
 
-function updatePriceTextTexture(price, goingUp) {
-    const priceText = `$ ${price.toFixed(2)}`;
+// =================== RENDER TEXT ==========================
+function renderText(text, fontData, fontSize, x, y) {
+    const positions = [];
+    const uvs = [];
 
-    // Use high DPI scaling for crisp text
-    const dpr = window.devicePixelRatio || 1;
-    const fontSize = 69;
-    const scaledFontSize = fontSize * dpr;
-    
-    // Set up high-resolution context
-    textCtx.font = `bold ${scaledFontSize}px Arial, sans-serif`;
-    const metrics = textCtx.measureText(priceText);
-    
-    // Calculate high-resolution dimensions
-    const width = Math.ceil(metrics.width + 4 * dpr); // Add small padding
-    const height = Math.ceil(scaledFontSize * 1.2); // Add line height
+    const atlasW = fontData.atlas.width;
+    const atlasH = fontData.atlas.height;
 
-    textCanvas.width = width;
-    textCanvas.height = height;
+    const glyphs = fontData.variants[0].glyphs;
 
-    // Enable high-quality text rendering
-    textCtx.imageSmoothingEnabled = true;
-    textCtx.imageSmoothingQuality = 'high';
-    textCtx.textRenderingOptimization = 'optimizeQuality';
+    let cursorX = x;
+    let cursorY = y; 
 
-    // Clear with fully transparent background
-    textCtx.clearRect(0, 0, width, height);
-    
-    // Set up high-quality text rendering
-    textCtx.font = `${scaledFontSize}px Arial, sans-serif`;
-    textCtx.textAlign = 'left';
-    textCtx.textBaseline = 'top';
-    textCtx.fillStyle = goingUp ? "#67a86a" : "#e74c3c";
-    
-    // Add subtle text shadow for better definition
-    textCtx.shadowColor = 'rgba(0, 0, 0, 0.3)';
-    textCtx.shadowBlur = 2 * dpr;
-    textCtx.shadowOffsetX = 1 * dpr;
-    textCtx.shadowOffsetY = 1 * dpr;
-    
-    // Draw text at proper position with padding
-    textCtx.fillText(priceText, 2 * dpr, (height - scaledFontSize) / 2);
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        const code = ch.charCodeAt(0);
 
-    // Update texture with linear filtering for smooth scaling
-    gl.bindTexture(gl.TEXTURE_2D, textTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textCanvas);
+        const glyph = glyphs.find(g => g.unicode === code);
+        if (!glyph) continue;
+
+        if (glyph.planeBounds && glyph.atlasBounds) {
+            
+            const pb = glyph.planeBounds;
+            const ab = glyph.atlasBounds;
+
+            const x0 = cursorX + pb.left * fontSize;
+            const y0 = cursorY + pb.bottom * fontSize;
+            const x1 = cursorX + pb.right * fontSize;
+            const y1 = cursorY + pb.top * fontSize;
+            console.log(ch, glyph,x0,x1,y0,y1);
+
+            positions.push(
+                x0, y0,
+                x1, y0,
+                x0, y1,
+                x0, y1,
+                x1, y0,
+                x1, y1
+            );
+
+            const u0 = ab.left / atlasW;
+            const v0 = 1.0 - (ab.top / atlasH);
+            const u1 = ab.right / atlasW;
+            const v1 = 1.0 - (ab.bottom / atlasH);
+
+
+
+
+            uvs.push(
+                u0, v0,
+                u1, v0,
+                u0, v1,
+                u0, v1,
+                u1, v0,
+                u1, v1
+            );
+        }
+        cursorX += (glyph.advance) * fontSize;
+    }
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.DYNAMIC_DRAW);
+    gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, uvBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(uvs), gl.DYNAMIC_DRAW);
+    gl.vertexAttribPointer(a_uv, 2, gl.FLOAT, false, 0, 0);
+
+    gl.drawArrays(gl.TRIANGLES, 0, positions.length / 2);
+
+}
+
+
+
+
+init();
+
+
+
+
+
+
+async function drawImage(image, x, y, width, height){
+    // Convert pixels to clip space
+    const x0 = (x / canvas.width) * 2 - 1;
+    const x1 = ((x + width) / canvas.width) * 2 - 1;
+    const y0 = ((canvas.height - y - height) / canvas.height) * 2 - 1; // bottom
+    const y1 = ((canvas.height - y) / canvas.height) * 2 - 1; // top
+
+    const positions = new Float32Array([
+        x0, y0,
+        x1, y0,
+        x0, y1,
+        x0, y1,
+        x1, y0,
+        x1, y1
+    ]);
+
+    const texcoords = new Float32Array([
+        0, 0,  1, 0,  0, 1,
+        0, 1,  1, 0,  1, 1
+    ]);
+
+    // Position buffer
+    const positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, positions, gl.DYNAMIC_DRAW);
+    const a_position = gl.getAttribLocation(program2, 'a_position');
+    gl.enableVertexAttribArray(a_position);
+    gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+
+    // Texcoord buffer
+    const texcoordBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, texcoordBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, texcoords, gl.STATIC_DRAW);
+    const a_texcoord = gl.getAttribLocation(program2, 'a_texcoord');
+    gl.enableVertexAttribArray(a_texcoord);
+    gl.vertexAttribPointer(a_texcoord, 2, gl.FLOAT, false, 0, 0);
+
+    // Create texture
+    const texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+
+    // Set rotation in radians
+    const angle = Math.PI / 2; // 45 degrees
+    const u_angle = gl.getUniformLocation(program2, "u_angle");
+    gl.uniform1f(u_angle, angle);
+
+    // Compute image center in clip space
+    const centerX = ((x + width / 2) / canvas.width) * 2 - 1;
+    const centerY = ((canvas.height - (y + height / 2)) / canvas.height) * 2 - 1;
+
+    const u_center = gl.getUniformLocation(program2, "u_center");
+    gl.uniform2f(u_center, centerX, centerY);
+
+    const u_tint = gl.getUniformLocation(program2, "u_tint");
+
+    // Example: red tint
+    gl.uniform4f(u_tint, 10.0, 0.0, 0.0, 1.0); // RGBA
+
+
+    // Draw
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
 }
-
-function drawAll(newValue) {
-    const goingUp = newValue >= currentValue;
-    const arrowRotation = goingUp ? Math.PI / 2 : -Math.PI / 2;
-    const tintColor = goingUp ? [0.35, 0.64, 0.39, 1] : [0.91, 0.3, 0.24, 1];
-
-    priceHistory.push(newValue);
-    if (priceHistory.length > maxPoints) priceHistory.shift();
-
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-
-    // Enable blending for gradient transparency
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-    drawGraphLine();
-
-    // Keep blending enabled for text anti-aliasing
-    updatePriceTextTexture(newValue, goingUp);
-
-    // Scale text rendering to account for high DPI
-    const dpr = window.devicePixelRatio || 1;
-    const textWidth = textCanvas.width / dpr;
-    const textHeight = textCanvas.height / dpr;
-    const centerX = (canvas.width - textWidth) / 2 - 32;
-    const centerY = 172 - textHeight / 2;
-
-    drawTexturedQuad(textTexture, centerX, centerY, textWidth, textHeight, 0, [1, 1, 1, 1], false);
-
-    if (arrowLoaded) {
-        const maxArrowHeight = 32;
-        const arrowAspect = imgArrow.width / imgArrow.height;
-        const arrowHeight = maxArrowHeight;
-        const arrowWidth = 52;
-
-        const arrowX = centerX + textWidth + 10;
-        const arrowY = centerY + (textHeight - arrowHeight) / 2 - 5;
-
-        drawTexturedQuad(arrowTexture, arrowX, arrowY, arrowWidth, arrowHeight, arrowRotation, tintColor, true);
-    }
-
-    // Draw platform/pair text below price text with proper scaling
-    const platformY = centerY + textHeight + 5;
-    const platformWidth = platformTextCanvas.width / dpr;
-    const platformHeight = platformTextCanvas.height / dpr;
-    const platformX = (canvas.width - platformWidth) / 2;
-    
-    drawTexturedQuad(platformTextTexture, platformX, platformY, platformWidth, platformHeight, 0, [1, 1, 1, 1], false);
-
-    gl.disable(gl.BLEND);
-
-    //currentValue = newValue;
-}
-let iters = 0;
-function animationSimulation(change, newvalue) {
-    return new Promise((resolve) => {
-        let curVal = currentValue;
-        let steps = 25;
-        let i = 0;
-        let stepChange = change / steps;
-
-        function anim() {
-            if (i >= steps) {
-                curVal = newvalue;
-                drawAll(curVal);
-                resolve(curVal);  // ✅ Waits until animation is done
-                return;
-            }
-
-            curVal += stepChange;
-            drawAll(curVal);
-            i++;
-            setTimeout(anim, 10);
-        }
-
-        anim();
-    });
-}
-
-async function startSimulation() {
-    while (true) {
-        const change = (Math.random() - 0.5) * 2;
-        const newValue = currentValue + change;
-        currentValue = await animationSimulation(change, newValue);
-        //console.log("Done:", currentValue);
-        await new Promise(r => setTimeout(r, 250));
-    }
-}
+//# sourceMappingURL=/sm/f4df2bd9dc6111d5e715f209c3b1eb6ebf545563d715d85fc0ee22fe9aff26cf.map
